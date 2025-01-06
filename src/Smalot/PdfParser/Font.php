@@ -33,6 +33,7 @@
 namespace Smalot\PdfParser;
 
 use Smalot\PdfParser\Encoding\WinAnsiEncoding;
+use Smalot\PdfParser\Exception\ByteOverrunException;
 use Smalot\PdfParser\Exception\EncodingNotFoundException;
 
 /**
@@ -154,6 +155,35 @@ class Font extends PDFObject
     }
 
     /**
+     * Convert unicode character code sequence to "utf-8" encoded string. Optionally adding an offset
+     *
+     * @param string $deststring HEX string sequence. Will be processed in blocks of 4.
+     */
+    public static function ustr($deststring, $range_add = 0): string
+    {
+        // According to the PDF reference the destination string can be up to 512 bytes
+        // and the addition is done on the last byte. That means: the creator must ensure that the addition to the
+        // last byte of the destination string does not exceed 0xFF
+        $s = '';
+        $hex_blocks = str_split($deststring, 4);
+        while ($hex_block = array_shift($hex_blocks)) {
+            if (empty($hex_blocks) and $range_add > 0) {
+                // adjust last byte
+                $hex_bytes = str_split($hex_block, 2);
+                $low_byte = hexdec($hex_bytes[1]) + $range_add;
+                if ($low_byte > 255) {
+                    throw new ByteOverrunException();
+                }
+                $hex_block = sprintf($hex_bytes[0] . "%02X", $low_byte);
+            }
+            $code = hexdec($hex_block);
+            $s .= self::uchr($code);
+        }
+
+        return $s;
+    }
+
+    /**
      * Init internal chars translation table by ToUnicode CMap.
      */
     public function loadTranslateTable(): array
@@ -214,47 +244,33 @@ class Font extends PDFObject
             }
 
             // Support for multiple bfrange sections
-            if (preg_match_all('/beginbfrange(?P<sections>.*?)endbfrange/s', $content, $matches)) {
-                foreach ($matches['sections'] as $section) {
+            if (preg_match_all('/beginbfrange(?P<sections>.*?)endbfrange/s', $content, $section_matches)) {
+                foreach ($section_matches['sections'] as $section) {
                     // Support for : <srcCode1> <srcCode2> <dstString>
-                    $regexp = '/<(?P<from>[0-9A-F]+)> *<(?P<to>[0-9A-F]+)> *<(?P<offset>[0-9A-F]+)>[ \r\n]+/is';
-
+                    $regexp = '/<(?P<from>[0-9A-F]+)> *<(?P<to>[0-9A-F]+)> *(<(?P<offset>[0-9A-F]+)>|\[(?P<map>(<[0-9A-F]+> *)+)\])[ \r\n]+/is';
+                    $matches = null;
                     preg_match_all($regexp, $section, $matches);
 
                     foreach ($matches['from'] as $key => $from) {
-                        $char_from = hexdec($from);
-                        $char_to = hexdec($matches['to'][$key]);
-                        $offset = hexdec($matches['offset'][$key]);
-
-                        for ($char = $char_from; $char <= $char_to; ++$char) {
-                            $this->table[$char] = self::uchr($char - $char_from + $offset);
-                        }
-                    }
-
-                    // Support for : <srcCode1> <srcCodeN> [<dstString1> <dstString2> ... <dstStringN>]
-                    // Some PDF file has 2-byte Unicode values on new lines > added \r\n
-                    $regexp = '/<(?P<from>[0-9A-F]+)> *<(?P<to>[0-9A-F]+)> *\[(?P<strings>[\r\n<>0-9A-F ]+)\][ \r\n]+/is';
-
-                    preg_match_all($regexp, $section, $matches);
-
-                    foreach ($matches['from'] as $key => $from) {
-                        $char_from = hexdec($from);
-                        $strings = [];
-
-                        preg_match_all('/<(?P<string>[0-9A-F]+)> */is', $matches['strings'][$key], $strings);
-
-                        foreach ($strings['string'] as $position => $string) {
-                            $parts = preg_split(
-                                '/([0-9A-F]{4})/i',
-                                $string,
-                                0,
-                                \PREG_SPLIT_NO_EMPTY | \PREG_SPLIT_DELIM_CAPTURE
-                            );
-                            $text = '';
-                            foreach ($parts as $part) {
-                                $text .= self::uchr(hexdec($part));
+                        if (!empty($matches['map'][$key])) {
+                            $char_from = hexdec($from);
+                            $char_to = hexdec($matches['to'][$key]);
+                            $regexp = '/<([0-9A-F]+)>/is';
+                            $map_matches = null;
+                            preg_match_all($regexp, $matches['map'][$key], $map_matches);
+                            for ($char = $char_from; $char <= $char_to; ++$char) {
+                                $this->table[$char] = self::ustr($map_matches[1][$char - $char_from]);
                             }
-                            $this->table[$char_from + $position] = $text;
+                        } elseif (!empty($matches['offset'][$key])) {
+                            $char_from = hexdec($from);
+                            $char_to = hexdec($matches['to'][$key]);
+                            $offset = hexdec($matches['offset'][$key]);
+
+                            for ($char = $char_from; $char <= $char_to; ++$char) {
+                                $this->table[$char] = self::ustr($matches['offset'][$key], $char - $char_from);
+                            }
+                        } else {
+                            throw new \Exception('Unhandled bfrange entry: ' . $from);
                         }
                     }
                 }
